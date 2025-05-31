@@ -1,0 +1,217 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta
+    name="viewport"
+    content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no"
+  />
+  <title>UPI Payment</title>
+
+  <!-- Bootstrap 5 CSS (CDN) -->
+  <link
+    href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/css/bootstrap.min.css"
+    rel="stylesheet"
+    integrity="sha384-ENjdO4Dr2bkBIFxQpeoVnYjHoA72hS+shirRBIhlzl9W4rZ/jm59IuZr9Qbsw3"
+    crossorigin="anonymous"
+  />
+
+  <!-- Optional: Google Fonts for a cleaner look -->
+  <link
+    href="https://fonts.googleapis.com/css2?family=Roboto:wght@400;500;700&display=swap"
+    rel="stylesheet"
+  />
+
+  <!-- Custom CSS -->
+  <link rel="stylesheet" href="css/styles.css" />
+</head>
+<body>
+  <div class="container py-4">
+    <!-- ─────────────── HEADER ─────────────── -->
+    <div class="text-center mb-4">
+      <img src="https://your‐logo‐url/upi-payment-logo.png" alt="UPI Payment" class="mb-2" style="height: 40px;" />
+      <!-- You can replace the above <img> with a text logo if desired -->
+      <div id="orderIdText" class="small text-muted">Order: <span id="outTradeNo">—</span></div>
+      <div class="display-6 fw-bold mt-2">₹ <span id="amountText">0</span></div>
+      <div class="text-secondary small">Use Mobile Scan code to pay</div>
+    </div>
+
+    <!-- ───────── QR CODE SECTION ───────── -->
+    <div class="card mx-auto mb-3" style="max-width: 400px;">
+      <div class="card-body text-center">
+        <!-- If API returns qrBase64, we’ll set #qrCodeImg.src = "data:image/png;base64,..." -->
+        <img id="qrCodeImg" src="" alt="UPI QR Code" class="img-fluid" style="max-width: 250px;" />
+        <!-- If API returns only UPI URL, we’ll hide this <img> and use JS to render a <canvas> via QRCode.js -->
+        <canvas id="qrCanvas" style="display: none;"></canvas>
+        <div class="mt-2">
+          <button id="downloadQrBtn" class="btn btn-sm btn-outline-primary">Save QRCode</button>
+        </div>
+      </div>
+    </div>
+
+    <!-- ───────── INSTRUCTIONS TEXT ───────── -->
+    <div class="mx-auto mb-4" style="max-width: 400px;">
+      <ol class="small text-muted ps-3">
+        <li>For iOS phones: long‐press the QR code and enter the wallet for payment.</li>
+        <li>For Android phones: long‐press & screenshot and manually open the wallet to upload the QR code for payment.</li>
+        <li>Please avoid making duplicate payments.</li>
+        <li>After completing the payment, please fill in the 12‐digit UTR below.</li>
+      </ol>
+    </div>
+
+    <!-- ───────── PAYMENT OPTIONS ACCORDION ───────── -->
+    <div class="accordion mb-3" id="paymentOptionsAccordion">
+      <div class="accordion-item">
+        <h2 class="accordion-header" id="headingPaytm">
+          <button
+            class="accordion-button"
+            type="button"
+            data-bs-toggle="collapse"
+            data-bs-target="#collapsePaytm"
+            aria-expanded="true"
+            aria-controls="collapsePaytm"
+          >
+            <img src="https://seeklogo.com/images/P/paytm-logo-829CCE1EE6-seeklogo.com.png" alt="Paytm" style="height: 24px; margin-right: 8px;" />
+            Paytm
+          </button>
+        </h2>
+        <div
+          id="collapsePaytm"
+          class="accordion-collapse collapse show"
+          aria-labelledby="headingPaytm"
+          data-bs-parent="#paymentOptionsAccordion"
+        >
+          <div class="accordion-body">
+            Open your Paytm UPI app → Tap “Scan & Pay” → Scan the QR above → Complete the payment.
+          </div>
+        </div>
+      </div>
+      <div class="accordion-item">
+        <h2 class="accordion-header" id="headingPhonePe">
+          <button
+            class="accordion-button collapsed"
+            type="button"
+            data-bs-toggle="collapse"
+            data-bs-target="#collapsePhonePe"
+            aria-expanded="false"
+            aria-controls="collapsePhonePe"
+          >
+            <img src="https://upload.wikimedia.org/wikipedia/commons/9/9a/PhonePe_logo.png" alt="PhonePe" style="height: 24px; margin-right: 8px;" />
+            PhonePe
+          </button>
+        </h2>
+        <div
+          id="collapsePhonePe"
+          class="accordion-collapse collapse"
+          aria-labelledby="headingPhonePe"
+          data-bs-parent="#paymentOptionsAccordion"
+        >
+          <div class="accordion-body">
+            Open your PhonePe app → Tap “Scan & Pay” → Scan the QR above → Complete the payment.
+          </div>
+        </div>
+      </div>
+      <div class="accordion-item">
+        <h2 class="accordion-header" id="headingGPay">
+          <button
+            class="accordion-button collapsed"
+            type="button"
+            data-bs-toggle="collapse"
+            data-bs-target="#collapseGPay"
+            aria-expanded="false"
+            aria-controls="collapseGPay"
+          >
+            <img src="https://upload.wikimedia.org/wikipedia/commons/5/5a/Google_Pay_%28GPay%29_Logo_%282020%29.svg" alt="GPay" style="height: 24px; margin-right: 8px;" />
+            G Pay
+          </button>
+        </h2>
+        <div
+          id="collapseGPay"
+          class="accordion-collapse collapse"
+          aria-labelledby="headingGPay"
+          data-bs-parent="#paymentOptionsAccordion"
+        >
+          <div class="accordion-body">
+            Open Google Pay → Tap “Scan any UPI QR” → Scan the QR above → Complete the payment.
+          </div>
+        </div>
+      </div>
+      <div class="accordion-item">
+        <h2 class="accordion-header" id="headingUPI">
+          <button
+            class="accordion-button collapsed"
+            type="button"
+            data-bs-toggle="collapse"
+            data-bs-target="#collapseUPI"
+            aria-expanded="false"
+            aria-controls="collapseUPI"
+          >
+            <img src="https://upload.wikimedia.org/wikipedia/commons/4/4d/Unified_Payments_Interface_logo.png" alt="UPI" style="height: 24px; margin-right: 8px;" />
+            UPI
+          </button>
+        </h2>
+        <div
+          id="collapseUPI"
+          class="accordion-collapse collapse"
+          aria-labelledby="headingUPI"
+          data-bs-parent="#paymentOptionsAccordion"
+        >
+          <div class="accordion-body">
+            Any UPI app (Bhim, Axis Pay, etc.) → Tap “Scan & Pay” → Scan the QR above → Complete the payment.
+            <div class="mt-2 small text-danger">
+              * If you pay with PhonePe/GPay etc., copy UPI URL number to the clipboard after payment successfully.
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <!-- ───────── UTR INPUT BAR ───────── -->
+    <div class="mb-4" style="max-width: 400px; margin: 0 auto;">
+      <label for="utrInput" class="form-label small text-muted">UTR <span class="text-danger">*</span></label>
+      <div class="input-group mb-2">
+        <input
+          type="text"
+          id="utrInput"
+          class="form-control"
+          placeholder="Input 12‐digit here"
+          maxlength="12"
+          pattern="\d{12}"
+        />
+        <button id="submitUtrBtn" class="btn btn-primary">Submit Ref Number</button>
+      </div>
+      <div id="utrFeedback" class="small text-danger"></div>
+    </div>
+
+    <!-- ───────── FOOTER NOTICE ───────── -->
+    <div class="mx-auto text-center text-muted small" style="max-width: 400px;">
+      <p class="mb-1">
+        1. If your gold coins have not been credited to your account, please fill in UTR to recover your funds.
+      </p>
+      <p class="mb-0">
+        2. Please select the payment method you need and make sure your phone has the corresponding wallet software installed.
+      </p>
+    </div>
+  </div>
+
+  <!-- jQuery (CDN) -->
+  <script
+    src="https://code.jquery.com/jquery-3.6.0.min.js"
+    integrity="sha256-K+3abkl1NL+6FIcM1E9BxJzzK8udOfQ5SwtDmHronLo="
+    crossorigin="anonymous"
+  ></script>
+
+  <!-- Bootstrap 5 JS Bundle (Popper + JS) -->
+  <script
+    src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/js/bootstrap.bundle.min.js"
+    integrity="sha384-qEWmaj31UajABxQAPMi6I1B8zqek0uPTLJN569Q8wW+EN3eY6fbqI33nP+7MoF2"
+    crossorigin="anonymous"
+  ></script>
+
+  <!-- QRCode.js (for generating a QR from a UPI URL) -->
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/qrcodejs/1.0.0/qrcode.min.js"></script>
+
+  <!-- Main front-end logic -->
+  <script src="js/main.js"></script>
+</body>
+</html>
