@@ -1,0 +1,38 @@
+/* ===== styles.css ===== */
+
+/* Use Roboto everywhere */
+body {
+  font-family: "Roboto", sans-serif;
+  background-color: #f8f9fa; /* light gray bg like your screenshot */
+  color: #333;
+}
+
+/* Center container nicely */
+.container {
+  max-width: 480px;
+}
+
+/* Make the “display-6” amount a bit larger & bold */
+.display-6 {
+  font-size: 2.5rem;
+}
+
+/* Style the “Save QRCode” button */
+#downloadQrBtn {
+  font-size: 0.9rem;
+}
+
+/* Input‐group (UTR) tweaks */
+#utrInput {
+  letter-spacing: 0.15em;
+}
+
+/* Override Bootstrap’s .card border to match screenshot */
+.card {
+  border: 1px solid #ddd;
+}
+
+/* Footer small text spacing */
+.container p {
+  margin-bottom: 0.25rem;
+}
