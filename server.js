@@ -1,589 +1,282 @@
-// server.js - UPI Payment Gateway Backend Server
-require('dotenv').config();
+// ===== server.js =====
+const express = require("express");
+const bodyParser = require("body-parser");
+const crypto = require("crypto");
+const axios = require("axios");
+const helmet = require("helmet");
+const morgan = require("morgan");
+const path = require("path");
 
-const express = require('express');
-const crypto = require('crypto');
-const axios = require('axios');
-const bodyParser = require('body-parser');
-const cors = require('cors');
-const helmet = require('helmet');
-const morgan = require('morgan');
-const rateLimit = require('express-rate-limit');
-const winston = require('winston');
-const path = require('path');
-const fs = require('fs');
-
-// Import utilities
-const { PaymentUtils, PaymentStatus, PaymentType } = require('./utils/payment');
-const { DatabaseService } = require('./utils/database');
-const { ValidationMiddleware } = require('./middleware/validation');
-const { ErrorHandler } = require('./middleware/errorHandler');
-
-// Initialize Express app
 const app = express();
-const PORT = process.env.PORT || 3000;
+// Basic security headers + JSON parsing
+app.use(helmet());
+app.use(bodyParser.json());
+app.use(morgan("dev"));
 
-// Configuration
-const config = {
-    mchId: process.env.MCH_ID || '1000',
-    key: process.env.API_KEY || 'eb6080dbc8dc429ab86a1cd1c337975d',
-    apiHost: process.env.API_HOST || 'https://sandbox.wpay.one',
-    callbackIP: process.env.CALLBACK_IP || '27.124.45.41',
-    domain: process.env.DOMAIN || 'https://pay.mehulbhatt.net',
-    environment: process.env.NODE_ENV || 'development'
-};
+// Serve front-end files from /public
+app.use(express.static(path.join(__dirname, "public")));
 
-// Logger configuration
-const logger = winston.createLogger({
-    level: 'info',
-    format: winston.format.combine(
-        winston.format.timestamp(),
-        winston.format.errors({ stack: true }),
-        winston.format.json()
-    ),
-    defaultMeta: { service: 'upi-payment' },
-    transports: [
-        new winston.transports.File({ 
-            filename: '/var/log/upi-payment/error.log', 
-            level: 'error' 
-        }),
-        new winston.transports.File({ 
-            filename: '/var/log/upi-payment/combined.log' 
-        })
-    ]
-});
+// ───  CONFIGURATION  ────────────────────────────────────────────────────────────
+// (1) Sandbox credentials from wpay.one
+const WPAY_HOST = "https://sandbox.wpay.one"; // base URL for sandbox
+const MCH_ID = "1000";
+const SECRET_KEY = "eb6080dbc8dc429ab86a1cd1c337975d";
 
-// Add console transport in development
-if (config.environment !== 'production') {
-    logger.add(new winston.transports.Console({
-        format: winston.format.simple()
-    }));
+// (2) Your public domain where you host this code
+//     Make sure this matches exactly, including https://, no trailing slash.
+const PUBLIC_DOMAIN = "https://pay.mehulbhatt.net";
+
+// (3) The endpoint to receive pay-in callbacks
+//     This must be reachable from sandbox.wpay.one; 
+//     they will POST here ~10s after you create an order.
+const PAYIN_CALLBACK_PATH = "/api/payin-callback";
+const PAYIN_CALLBACK_URL = PUBLIC_DOMAIN + PAYIN_CALLBACK_PATH;
+
+// ───  IN‐MEMORY  “DATABASE”  ───────────────────────────────────────────────────────
+// In production, swap this out for a real DB (MySQL / Redis / etc.).
+// orders[outTradeNo] = { amount, status, upiUrl, qrBase64, createdAt, lastCallbackData }
+const orders = {};
+
+// ───  UTILITY: MD5 SIGNING  ────────────────────────────────────────────────────────
+// The sandbox docs say you must build a string of parameters in alphabetical order, concat them, 
+// then append the key, then MD5 hex‐digest (uppercase).  
+//
+//   e.g. stringA = "amount=500&mchId=1000&notifyUrl=...&outTradeNo=1654321"; 
+//        stringToSign = stringA + "&key=" + SECRET_KEY; 
+//        sign = MD5(stringToSign).toUpperCase();
+//
+// NOTE: Always consult the exact Postman docs for parameter ordering & URL encoding details.
+function md5Sign(paramsObject) {
+  // 1) Extract keys, sort them lexographically
+  const keys = Object.keys(paramsObject).sort();
+  // 2) Build “key=value” pairs joined by &
+  const kvPairs = keys.map((k) => `${k}=${paramsObject[k]}`);
+  // 3) Append “key=<SECRET_KEY>”
+  kvPairs.push(`key=${SECRET_KEY}`);
+  // 4) MD5 → uppercase
+  const rawString = kvPairs.join("&");
+  const hash = crypto.createHash("md5").update(rawString, "utf8").digest("hex");
+  return hash.toUpperCase();
 }
 
-// Initialize database service
-const db = new DatabaseService(logger);
-
-// Middleware
-app.use(helmet({
-    contentSecurityPolicy: {
-        directives: {
-            defaultSrc: ["'self'"],
-            styleSrc: ["'self'", "'unsafe-inline'", "https://cdnjs.cloudflare.com"],
-            scriptSrc: ["'self'", "'unsafe-inline'", "https://cdnjs.cloudflare.com"],
-            imgSrc: ["'self'", "data:", "https:"],
-            connectSrc: ["'self'"],
-            fontSrc: ["'self'", "https://cdnjs.cloudflare.com"],
-        },
-    },
-}));
-
-app.use(cors({
-    origin: function (origin, callback) {
-        const allowedOrigins = [
-            'http://localhost:3000',
-            'https://pay.mehulbhatt.net',
-            config.domain
-        ];
-        
-        if (!origin || allowedOrigins.indexOf(origin) !== -1) {
-            callback(null, true);
-        } else {
-            callback(new Error('Not allowed by CORS'));
-        }
-    },
-    credentials: true
-}));
-
-app.use(bodyParser.json({ limit: '10mb' }));
-app.use(bodyParser.urlencoded({ extended: true, limit: '10mb' }));
-
-// Request logging
-app.use(morgan('combined', {
-    stream: {
-        write: (message) => logger.info(message.trim())
+// ───  ROUTE: POST /api/create-order  ───────────────────────────────────────────────
+// Request JSON: { amount: number, outTradeNo?: string (optional) }
+// If outTradeNo is not provided, we’ll generate a UUID‐style string.
+app.post("/api/create-order", async (req, res) => {
+  try {
+    let { amount, outTradeNo } = req.body;
+    if (!amount) {
+      return res.status(400).json({ error: "Missing `amount` in request body." });
     }
-}));
 
-// Rate limiting
-const createOrderLimiter = rateLimit({
-    windowMs: 15 * 60 * 1000, // 15 minutes
-    max: 50, // limit each IP to 50 requests per windowMs
-    message: 'Too many payment requests, please try again later',
-    standardHeaders: true,
-    legacyHeaders: false,
-});
+    // 1) Generate a unique outTradeNo if none provided
+    if (!outTradeNo) {
+      // e.g. “MB20230531123045” or use current timestamp + random
+      outTradeNo = "MB" + Date.now();
+    }
 
-const generalLimiter = rateLimit({
-    windowMs: 15 * 60 * 1000,
-    max: 100,
-    message: 'Too many requests, please try again later'
-});
+    // 2) Build the parameters per wpay.one Postman docs.
+    //    The “Create Order” API for a UPI‐type payin usually wants:
+    //      mchId, outTradeNo, amount, currency (if required), subject, body (optional),
+    //      notifyUrl (your callback), any ‘extra’ map (like payType=UPI),
+    //      timestamp (if they require), nonceStr (if they require), etc.
+    //
+    //    Refer to the Postman collection to confirm the exact field names. 
+    //    In our example, let’s assume the doc says:
+    //      {
+    //        mchId: "1000",
+    //        outTradeNo: "XXXXXXXX",
+    //        amount: "500",              // amount in rupees (string)
+    //        payType: "UPI",             // because we want a UPI QR
+    //        subject: "Order Payment",
+    //        notifyUrl: "https://pay.mehulbhatt.net/api/payin-callback",
+    //        timestamp: "20230531123045" // yyyymmddHHMMSS
+    //      }
+    //
+    //    Then we sign exactly those fields (alphabetical sort), plus key=SECRET_KEY.
 
-// Apply rate limiting
-app.use('/api/create-order', createOrderLimiter);
-app.use('/api/', generalLimiter);
-
-// Serve static files
-app.use(express.static(path.join(__dirname, 'public')));
-
-// Request ID middleware
-app.use((req, res, next) => {
-    req.id = crypto.randomBytes(16).toString('hex');
-    res.setHeader('X-Request-ID', req.id);
-    next();
-});
-
-// API Routes
-
-// Health check endpoint
-app.get('/api/health', (req, res) => {
-    const health = {
-        status: 'UP',
-        timestamp: new Date().toISOString(),
-        uptime: process.uptime(),
-        environment: config.environment,
-        version: process.env.npm_package_version || '1.0.0'
+    const timestamp = new Date()
+      .toISOString()
+      .replace(/[-:TZ.]/g, "")
+      .slice(0, 14); // “YYYYMMDDhhmmss”
+    const params = {
+      mchId: MCH_ID,
+      outTradeNo: outTradeNo,
+      amount: String(amount), // MUST be string
+      payType: "UPI",
+      subject: "Order Payment",
+      notifyUrl: PAYIN_CALLBACK_URL,
+      timestamp,
     };
-    
-    res.json(health);
-});
+    // Compute the signature
+    const sign = md5Sign(params);
+    // Attach signature to the payload
+    const payload = { ...params, sign };
 
-// Create payment order
-app.post('/api/create-order', ValidationMiddleware.validateCreateOrder, async (req, res, next) => {
-    const requestId = req.id;
-    
-    try {
-        const { amount, payType = PaymentType.UPI, returnUrl, extraData = {} } = req.body;
-        
-        logger.info(`Creating order: ${JSON.stringify({ amount, payType, requestId })}`);
-        
-        // Generate unique order number
-        const mchOrderNo = PaymentUtils.generateOrderNo('PAY');
-        
-        // Prepare order data
-        const orderData = {
-            mchId: config.mchId,
-            mchOrderNo: mchOrderNo,
-            amount: PaymentUtils.formatAmount(amount),
-            currency: 'INR',
-            payType: payType,
-            notifyUrl: `${config.domain}/api/notify`,
-            returnUrl: returnUrl || `${config.domain}/payment-status?order=${mchOrderNo}`,
-            subject: extraData.subject || 'Payment',
-            body: extraData.body || `Payment for order ${mchOrderNo}`,
-            signType: 'MD5',
-            reqTime: new Date().toISOString().replace('T', ' ').substring(0, 19),
-            clientIp: req.ip || req.connection.remoteAddress,
-            device: req.headers['user-agent'] || 'Unknown'
-        };
-
-        // Add extra parameters if provided
-        if (extraData.customerName) orderData.customerName = extraData.customerName;
-        if (extraData.customerEmail) orderData.customerEmail = extraData.customerEmail;
-        if (extraData.customerPhone) orderData.customerPhone = extraData.customerPhone;
-
-        // Generate signature
-        orderData.sign = PaymentUtils.generateSign(orderData, config.key);
-
-        // Make API request to create order
-        const response = await axios.post(
-            `${config.apiHost}/api/pay/create`,
-            orderData,
-            {
-                headers: {
-                    'Content-Type': 'application/json',
-                    'X-Request-ID': requestId
-                },
-                timeout: 30000 // 30 second timeout
-            }
-        );
-
-        logger.info(`Payment gateway response: ${JSON.stringify(response.data)}`);
-
-        if (response.data.code === 0 || response.data.code === '0') {
-            // Save order to database
-            const orderRecord = {
-                mchOrderNo,
-                platformOrderNo: response.data.data.platformOrderNo,
-                amount: orderData.amount,
-                currency: orderData.currency,
-                payType: orderData.payType,
-                status: PaymentStatus.PENDING,
-                payUrl: response.data.data.payUrl,
-                qrCode: response.data.data.qrCode || response.data.data.payUrl,
-                requestId,
-                clientIp: orderData.clientIp,
-                device: orderData.device,
-                extraData,
-                createdAt: new Date()
-            };
-
-            await db.saveOrder(orderRecord);
-
-            res.json({
-                success: true,
-                orderId: mchOrderNo,
-                platformOrderNo: response.data.data.platformOrderNo,
-                payUrl: response.data.data.payUrl,
-                qrCode: response.data.data.qrCode || response.data.data.payUrl,
-                amount: amount,
-                expiresIn: 600 // 10 minutes
-            });
-        } else {
-            throw new Error(response.data.msg || 'Failed to create order');
-        }
-    } catch (error) {
-        logger.error(`Create order error: ${error.message}`, { 
-            error: error.stack, 
-            requestId 
-        });
-        next(error);
-    }
-});
-
-// Query order status
-app.get('/api/order-status/:orderId', ValidationMiddleware.validateOrderId, async (req, res, next) => {
-    try {
-        const { orderId } = req.params;
-        
-        // Check cache first
-        const cachedOrder = await db.getOrder(orderId);
-        
-        if (cachedOrder && cachedOrder.status === PaymentStatus.SUCCESS) {
-            return res.json({
-                success: true,
-                status: cachedOrder.status,
-                amount: cachedOrder.amount,
-                actualAmount: cachedOrder.actualAmount,
-                completeTime: cachedOrder.completeTime,
-                cached: true
-            });
-        }
-
-        // Query from payment gateway
-        const queryData = {
-            mchId: config.mchId,
-            mchOrderNo: orderId,
-            signType: 'MD5',
-            reqTime: new Date().toISOString().replace('T', ' ').substring(0, 19)
-        };
-        
-        queryData.sign = PaymentUtils.generateSign(queryData, config.key);
-
-        const response = await axios.post(
-            `${config.apiHost}/api/pay/query`,
-            queryData,
-            {
-                headers: {
-                    'Content-Type': 'application/json'
-                },
-                timeout: 30000
-            }
-        );
-
-        if (response.data.code === 0 || response.data.code === '0') {
-            const statusData = response.data.data;
-            
-            // Update order in database
-            await db.updateOrderStatus(orderId, {
-                status: statusData.status,
-                platformOrderNo: statusData.platformOrderNo,
-                actualAmount: statusData.actualAmount,
-                completeTime: statusData.completeTime
-            });
-
-            res.json({
-                success: true,
-                status: statusData.status,
-                statusText: PaymentUtils.parseStatus(statusData.status).message,
-                amount: statusData.amount,
-                actualAmount: statusData.actualAmount,
-                completeTime: statusData.completeTime,
-                orderId: orderId,
-                platformOrderNo: statusData.platformOrderNo
-            });
-        } else {
-            throw new Error(response.data.msg || 'Failed to query order');
-        }
-    } catch (error) {
-        logger.error(`Query order error: ${error.message}`, { 
-            orderId: req.params.orderId,
-            error: error.stack 
-        });
-        next(error);
-    }
-});
-
-// Payment notification callback
-app.post('/api/notify', async (req, res) => {
-    const clientIP = req.ip || req.connection.remoteAddress;
-    const cleanIP = clientIP.replace(/^::ffff:/, '');
-    
-    try {
-        logger.info(`Received callback from IP: ${cleanIP}`, { body: req.body });
-        
-        // Verify IP in production
-        if (config.environment === 'production' && cleanIP !== config.callbackIP) {
-            logger.warn(`Unauthorized callback attempt from IP: ${cleanIP}`);
-            return res.status(403).send('Forbidden');
-        }
-
-        // Verify signature
-        if (!PaymentUtils.verifySign(req.body, config.key)) {
-            logger.error('Invalid signature in callback', { body: req.body });
-            return res.status(400).send('Invalid signature');
-        }
-
-        // Validate timestamp to prevent replay attacks
-        if (req.body.reqTime && !PaymentUtils.validateWebhookTimestamp(req.body.reqTime, 300)) {
-            logger.warn('Webhook timestamp too old', { timestamp: req.body.reqTime });
-            return res.status(400).send('Request too old');
-        }
-
-        const {
-            mchOrderNo,
-            platformOrderNo,
-            amount,
-            actualAmount,
-            status,
-            completeTime,
-            payType,
-            successTime
-        } = req.body;
-
-        // Update order status
-        const updateData = {
-            status: parseInt(status),
-            platformOrderNo,
-            actualAmount,
-            completeTime: completeTime || successTime,
-            callbackData: req.body
-        };
-
-        await db.updateOrderStatus(mchOrderNo, updateData);
-
-        // Log payment event
-        PaymentUtils.logPaymentEvent('payment_callback', {
-            orderId: mchOrderNo,
-            status: status,
-            amount: actualAmount
-        });
-
-        // Send success response
-        res.send('SUCCESS');
-
-        // Trigger any webhooks or notifications
-        if (parseInt(status) === PaymentStatus.SUCCESS) {
-            // You can add webhook notifications to your system here
-            logger.info(`Payment successful for order: ${mchOrderNo}`);
-        } else if (parseInt(status) === PaymentStatus.FAILED) {
-            logger.info(`Payment failed for order: ${mchOrderNo}`);
-        }
-
-    } catch (error) {
-        logger.error(`Callback processing error: ${error.message}`, { 
-            error: error.stack,
-            body: req.body 
-        });
-        res.status(500).send('ERROR');
-    }
-});
-
-// Submit UTR reference
-app.post('/api/submit-utr', ValidationMiddleware.validateUTR, async (req, res, next) => {
-    try {
-        const { orderId, utr } = req.body;
-        
-        // Get order
-        const order = await db.getOrder(orderId);
-        if (!order) {
-            return res.status(404).json({
-                success: false,
-                message: 'Order not found'
-            });
-        }
-
-        // Save UTR
-        await db.saveUTR(orderId, utr, {
-            submittedAt: new Date(),
-            ip: req.ip || req.connection.remoteAddress,
-            userAgent: req.headers['user-agent']
-        });
-
-        logger.info(`UTR submitted for order: ${orderId}`, { utr });
-
-        res.json({
-            success: true,
-            message: 'UTR submitted successfully',
-            orderId,
-            utr
-        });
-
-        // In production, you might want to notify the payment processor
-        // or trigger a manual verification process
-
-    } catch (error) {
-        logger.error(`Submit UTR error: ${error.message}`, { 
-            error: error.stack,
-            orderId: req.body.orderId 
-        });
-        next(error);
-    }
-});
-
-// Get payment methods
-app.get('/api/payment-methods', (req, res) => {
-    const methods = [
-        {
-            id: 'upi',
-            name: 'UPI',
-            code: PaymentType.UPI,
-            icon: 'upi',
-            enabled: true
-        },
-        {
-            id: 'paytm',
-            name: 'Paytm',
-            code: PaymentType.PAYTM,
-            icon: 'paytm',
-            enabled: true
-        },
-        {
-            id: 'phonepe',
-            name: 'PhonePe',
-            code: PaymentType.PHONEPE,
-            icon: 'phonepe',
-            enabled: true
-        },
-        {
-            id: 'gpay',
-            name: 'Google Pay',
-            code: PaymentType.GPAY,
-            icon: 'gpay',
-            enabled: true
-        }
-    ];
-
-    res.json({
-        success: true,
-        methods
-    });
-});
-
-// Admin endpoints (protected)
-app.get('/api/admin/orders', ValidationMiddleware.validateAdminAuth, async (req, res, next) => {
-    try {
-        const { page = 1, limit = 20, status, from, to } = req.query;
-        
-        const orders = await db.getOrders({
-            page: parseInt(page),
-            limit: parseInt(limit),
-            status,
-            from,
-            to
-        });
-
-        res.json({
-            success: true,
-            ...orders
-        });
-    } catch (error) {
-        next(error);
-    }
-});
-
-// Test endpoints (only in development/sandbox)
-if (config.environment !== 'production') {
-    app.post('/api/test/simulate-callback/:orderId/:status', async (req, res, next) => {
-        try {
-            const { orderId, status } = req.params;
-            
-            const callbackData = {
-                mchId: config.mchId,
-                mchOrderNo: orderId,
-                platformOrderNo: `TEST${Date.now()}`,
-                amount: '500',
-                actualAmount: '500',
-                status: status,
-                payType: PaymentType.UPI,
-                successTime: new Date().toISOString().replace('T', ' ').substring(0, 19),
-                signType: 'MD5'
-            };
-            
-            callbackData.sign = PaymentUtils.generateSign(callbackData, config.key);
-            
-            // Make internal callback
-            const response = await axios.post(
-                `http://localhost:${PORT}/api/notify`,
-                callbackData,
-                {
-                    headers: {
-                        'X-Forwarded-For': config.callbackIP
-                    }
-                }
-            );
-
-            res.json({ 
-                success: true, 
-                message: 'Test callback sent',
-                response: response.data
-            });
-        } catch (error) {
-            next(error);
-        }
-    });
-}
-
-// Error handling middleware
-app.use(ErrorHandler);
-
-// 404 handler
-app.use((req, res) => {
-    res.status(404).json({
-        success: false,
-        message: 'Resource not found',
-        path: req.path
-    });
-});
-
-// Graceful shutdown
-const gracefulShutdown = async (signal) => {
-    logger.info(`${signal} received. Starting graceful shutdown...`);
-    
-    // Stop accepting new connections
-    server.close(() => {
-        logger.info('HTTP server closed');
+    // 3) Send the request to sandbox.wpay.one’s “Create Order” endpoint.
+    //    Per their docs, it might be a POST to /pay/createOrder or /api/payin/create, etc.
+    //    Look up the exact path in Postman. In our example, assume:
+    //      POST https://sandbox.wpay.one/pay/createOrder
+    //
+    //    We need to set “Content-Type: application/json” and send `payload`.
+    const wpayUrl = `${WPAY_HOST}/pay/createOrder`;
+    const wpayResp = await axios.post(wpayUrl, payload, {
+      headers: {
+        "Content-Type": "application/json",
+      },
     });
 
-    // Close database connections
-    await db.close();
+    // 4) wpay.one should respond with something like:
+    //    {
+    //      code: "SUCCESS",
+    //      data: { 
+    //        upiUrl: "upi://pay?pa=1234567890@upi&pn=Mehul&am=500", 
+    //        qrCodeBase64: "<base64‐PNG data>" 
+    //      },
+    //      message: "Order created"
+    //    }
+    //
+    //    Adjust based on the actual response schema.
 
-    // Wait for ongoing requests to complete (max 30 seconds)
-    setTimeout(() => {
-        logger.error('Could not close connections in time, forcefully shutting down');
-        process.exit(1);
-    }, 30000);
-};
+    const { code, data, message } = wpayResp.data;
+    if (code !== "SUCCESS") {
+      return res.status(500).json({
+        error: "wpay.one returned failure",
+        details: wpayResp.data,
+      });
+    }
 
-// Start server
-const server = app.listen(PORT, () => {
-    logger.info(`UPI Payment Server running on port ${PORT}`);
-    logger.info(`Environment: ${config.environment}`);
-    logger.info(`API Host: ${config.apiHost}`);
+    // 5) Save this order in our in‐memory map
+    orders[outTradeNo] = {
+      amount,
+      status: "CREATED", // CREATED → PENDING → PAID (or FAILED)
+      upiUrl: data.upiUrl,
+      qrBase64: data.qrCodeBase64, // if the API returned Base64 PNG
+      createdAt: new Date(),
+      lastCallbackData: null,
+    };
+
+    // 6) Return to front‐end: { outTradeNo, upiUrl, qrBase64 }
+    return res.json({
+      outTradeNo,
+      upiUrl: data.upiUrl,
+      qrBase64: data.qrCodeBase64,
+    });
+  } catch (err) {
+    console.error("Error in /api/create-order:", err.response?.data || err.message);
+    return res.status(500).json({ error: "Internal server error", details: err.message });
+  }
 });
 
-// Handle shutdown signals
-process.on('SIGTERM', () => gracefulShutdown('SIGTERM'));
-process.on('SIGINT', () => gracefulShutdown('SIGINT'));
+// ───  ROUTE: POST /api/payin-callback  ───────────────────────────────────────────────
+// This is the URL you provided in “notifyUrl” when creating the order.
+// After wpay.one processes a payin, they will POST here (in ~10s) to tell you success/fail.
+//
+app.post("/api/payin-callback", (req, res) => {
+  // Step A) Parse incoming JSON from wpay.one
+  const callbackData = req.body;
+  // Example payload might look like:
+  // {
+  //   mchId: "1000",
+  //   outTradeNo: "MB1654034448371",
+  //   amount: "500",
+  //   payType: "UPI",
+  //   tradeStatus: "SUCCESS", // or "FAILED"
+  //   transactionId: "WPAY1234567890",
+  //   timestamp: "20230531123100",
+  //   sign: "ABCD1234EF567890..." 
+  // }
+  //
+  // Step B) Verify that “mchId” matches our MCH_ID
+  if (callbackData.mchId !== MCH_ID) {
+    console.warn("Invalid mchId in callback:", callbackData);
+    return res.status(400).send("invalid mchId");
+  }
+  // Step C) Extract the sign, then recompute MD5 on the rest of the fields
+  const { sign: incomingSign, ...rest } = callbackData;
+  const computedSign = md5Sign(rest);
+  if (computedSign !== incomingSign) {
+    console.warn("Signature mismatch on payin‐callback:", { incomingSign, computedSign });
+    return res.status(400).send("invalid signature");
+  }
 
-// Handle uncaught exceptions
-process.on('uncaughtException', (error) => {
-    logger.error('Uncaught Exception:', error);
-    gracefulShutdown('UNCAUGHT_EXCEPTION');
+  // Step D) Mark the order’s status based on “tradeStatus”
+  const { outTradeNo, tradeStatus } = callbackData;
+  if (!orders[outTradeNo]) {
+    console.warn("Unknown outTradeNo in payin‐callback:", outTradeNo);
+    // STILL respond 200 so wpay.one won’t retry?
+    return res.status(200).send("unknown order");
+  }
+
+  orders[outTradeNo].lastCallbackData = callbackData;
+  if (tradeStatus === "SUCCESS") {
+    orders[outTradeNo].status = "PAID";
+  } else {
+    orders[outTradeNo].status = "FAILED";
+  }
+
+  // Step E) Respond with a plain 200 and body “SUCCESS” (or whatever the docs ask for)
+  return res.status(200).send("SUCCESS");
 });
 
-process.on('unhandledRejection', (reason, promise) => {
-    logger.error('Unhandled Rejection at:', promise, 'reason:', reason);
+// ───  ROUTE: POST /api/verify-utr  ───────────────────────────────────────────────────
+// The front‐end will POST { outTradeNo: "...", utr: "XXXXXXXXXXXX" } after the user enters their UTR.
+// You simply check if orders[outTradeNo].status === "PAID". If yes, return { status: "SUCCESS" }.
+//
+// NOTE: You can also ignore UTR entirely if you simply trust wpay.one’s callback, but your UI wants a field
+//       so user can manually confirm. In that case, you can store utr in memory for record‐keeping.
+app.post("/api/verify-utr", (req, res) => {
+  const { outTradeNo, utr } = req.body;
+  if (!outTradeNo || !utr) {
+    return res.status(400).json({ error: "Missing outTradeNo or utr" });
+  }
+  if (!orders[outTradeNo]) {
+    return res.status(404).json({ error: "Order not found" });
+  }
+  // Only allow 12‐digit numeric UTR
+  if (!/^\d{12}$/.test(utr)) {
+    return res.status(400).json({ error: "UTR must be exactly 12 digits" });
+  }
+
+  // Save the UTR on our order (for record)
+  orders[outTradeNo].utr = utr;
+
+  // Check status
+  if (orders[outTradeNo].status === "PAID") {
+    return res.json({ status: "SUCCESS" });
+  } else if (orders[outTradeNo].status === "FAILED") {
+    return res.json({ status: "FAILED" });
+  } else {
+    // If still “CREATED” → “PENDING”
+    return res.json({ status: "PENDING" });
+  }
 });
 
-module.exports = app;
+// ───  (Optional) ROUTE: GET /api/order-status/:outTradeNo  ───────────────────────────── 
+// If you want to let the front‐end poll for status instead of having user enter UTR
+app.get("/api/order-status/:outTradeNo", (req, res) => {
+  const outTradeNo = req.params.outTradeNo;
+  if (!orders[outTradeNo]) {
+    return res.status(404).json({ error: "Order not found" });
+  }
+  return res.json({
+    outTradeNo,
+    status: orders[outTradeNo].status,
+    createdAt: orders[outTradeNo].createdAt,
+  });
+});
+
+// ───  CATCH‐ALL TO SERVE FRONT‐END  ─────────────────────────────────────────────────────
+// Any other GET → return index.html
+app.get("*", (req, res) => {
+  res.sendFile(path.join(__dirname, "public/index.html"));
+});
+
+// ───  START SERVER  ───────────────────────────────────────────────────────────────────
+const HTTP_PORT = 8443; // or 443 if you run as root and have SSL; for testing, 8443 is fine.
+app.listen(HTTP_PORT, () => {
+  console.log(`🚀 UPI pay‐in server listening on port ${HTTP_PORT}`);
+  console.log(` - create‐order: POST https://localhost:${HTTP_PORT}/api/create-order`);
+  console.log(` - payin‐callback: POST https://localhost:${HTTP_PORT}${PAYIN_CALLBACK_PATH}`);
+  console.log(` - verify‐utr: POST https://localhost:${HTTP_PORT}/api/verify-utr`);
+});
